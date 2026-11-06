@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The room reservation API that the web front end and the kiosk both call.
@@ -33,6 +34,12 @@ public final class BookingService {
     private final Map<String, Room> catalog;
     private final BookingStats stats = new BookingStats();
     private final AtomicLong sequence = new AtomicLong();
+
+    /**
+     * Makes a check of the store and the write that depends on it one step.
+     * Held only around those two store calls, never around logging or stats.
+     */
+    private final ReentrantLock bookingLock = new ReentrantLock();
 
     /**
      * @param store the backing store, shared with any other service instance
@@ -67,14 +74,34 @@ public final class BookingService {
         if (startMinute < 0 || endMinute <= startMinute) {
             return reject(roomId, startMinute, endMinute, "empty or reversed slot");
         }
-        if (store.hasOverlap(roomId, startMinute, endMinute)) {
+        Optional<Booking> confirmed = confirmIfFree(roomId, startMinute, endMinute);
+        if (confirmed.isEmpty()) {
             return reject(roomId, startMinute, endMinute, "slot already held");
         }
-        Booking booking = new Booking(nextId(), roomId, startMinute, endMinute, BookingStatus.CONFIRMED);
-        store.insert(booking);
+        Booking booking = confirmed.get();
         stats.recordConfirmed();
         BookingLog.confirmed(booking);
         return BookingResult.confirmed(booking);
+    }
+
+    /**
+     * The check and the insert as one step: no other caller holding
+     * {@link #bookingLock} can change the room between them.
+     *
+     * @return the new CONFIRMED booking, or empty when the slot is already held
+     */
+    private Optional<Booking> confirmIfFree(String roomId, int startMinute, int endMinute) {
+        bookingLock.lock();
+        try {
+            if (store.hasOverlap(roomId, startMinute, endMinute)) {
+                return Optional.empty();
+            }
+            Booking booking = new Booking(nextId(), roomId, startMinute, endMinute, BookingStatus.CONFIRMED);
+            store.insert(booking);
+            return Optional.of(booking);
+        } finally {
+            bookingLock.unlock();
+        }
     }
 
     /**
