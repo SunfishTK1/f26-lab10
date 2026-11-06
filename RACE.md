@@ -235,13 +235,242 @@ code's call shape.
 and the two operations it now covers. Paste the diff of your change and the
 passing run of your milestone-1 test and the full suite.
 
+**Option 3: an explicit `ReentrantLock`**, `bookingLock`, a field on
+`BookingService`. I chose it because it locks the check and the write together.
+If several requests come in at once, the others simply wait their turn. Safety
+matters more here than throughput.
+
+What it covers:
+
+- **`book()`: the `hasOverlap` check and the `insert`.** These are the two
+  operations from the ticket. They now run as one step inside
+  `confirmIfFree()`.
+- **`cancelBooking()`: the `cancelAndPromote` call.** A promotion is the only
+  other way to create a CONFIRMED booking, so it must not land between a
+  booking's check and its insert either (suspect row 3).
+
+I made the fix in two steps to show the second one is needed. I added a third
+race test, `aPromotionCannotLandBetweenABookingsCheckAndItsInsert`. A books
+[570, 600) and parks after its check, while C cancels X [540, 570), which
+promotes the waitlisted W [540, 600).
+
+- **Shipped code:** red. W was promoted and A was confirmed on top of it.
+- **Lock on `book()` only** (commit `8670460`): the milestone-1 test went
+  green, but the cancel test stayed red. `C done before release=true` means the
+  cancel went straight past the lock.
+- **Lock on both** (commit `8c6412b`): all green.
+
+Logging and stats stay outside the lock, so it is held only around store
+calls. I also corrected the class javadoc, which claimed the service was thread
+safe because the store is.
+
+Diff, shipped code to fix (`git diff a8dc8f5 HEAD -- src/main/java/edu/cmu/cs214/lab10/service/BookingService.java`):
+
+```diff
+diff --git a/src/main/java/edu/cmu/cs214/lab10/service/BookingService.java b/src/main/java/edu/cmu/cs214/lab10/service/BookingService.java
+index 514c3e1..b26532c 100644
+--- a/src/main/java/edu/cmu/cs214/lab10/service/BookingService.java
++++ b/src/main/java/edu/cmu/cs214/lab10/service/BookingService.java
+@@ -12,6 +12,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * The room reservation API that the web front end and the kiosk both call.
+@@ -19,12 +20,16 @@ import java.util.concurrent.atomic.AtomicLong;
+  * <p>Times are raw minutes from midnight and ranges are half-open, matching
+  * {@link Booking}.
+  *
+- * <p>Thread safety: safe for concurrent use. The service owns no mutable
+- * booking state of its own. The room catalog is built once in the constructor
+- * and never written again, and every read and write of booking data goes
+- * through {@link BookingStore}, whose methods are each synchronized. Since the
+- * store is thread safe, the operations built on top of it are too. The only
+- * other field that changes after construction is {@link BookingStats}, and its
++ * <p>Thread safety: safe for concurrent use through one service instance. The
++ * room catalog is built once in the constructor and never written again, and
++ * booking data lives in {@link BookingStore}, which makes each single call
++ * atomic. That is not enough on its own: an operation that checks the store
++ * and then writes based on the answer spans two calls, and the store's lock is
++ * released in between. So every path that can create a CONFIRMED booking takes
++ * {@code bookingLock} around its check and its write: {@link #book}'s overlap
++ * check and insert, and {@link #cancelBooking}'s cancel-and-promote. The lock
++ * belongs to this instance, so two services pointed at the same store do not
++ * exclude each other. {@link BookingStats} is still unsynchronized, and its
+  * numbers are documented as approximate.
+  */
+ public final class BookingService {
+@@ -34,6 +39,13 @@ public final class BookingService {
+     private final BookingStats stats = new BookingStats();
+     private final AtomicLong sequence = new AtomicLong();
+ 
++    /**
++     * Guards every path that can create a CONFIRMED booking, so a check of the
++     * store and the write that depends on it happen as one step. Held only
++     * around store calls, never around logging or stats.
++     */
++    private final ReentrantLock bookingLock = new ReentrantLock();
++
+     /**
+      * @param store the backing store, shared with any other service instance
+      *     pointed at the same data
+@@ -67,16 +79,36 @@ public final class BookingService {
+         if (startMinute < 0 || endMinute <= startMinute) {
+             return reject(roomId, startMinute, endMinute, "empty or reversed slot");
+         }
+-        if (store.hasOverlap(roomId, startMinute, endMinute)) {
++        Optional<Booking> confirmed = confirmIfFree(roomId, startMinute, endMinute);
++        if (confirmed.isEmpty()) {
+             return reject(roomId, startMinute, endMinute, "slot already held");
+         }
+-        Booking booking = new Booking(nextId(), roomId, startMinute, endMinute, BookingStatus.CONFIRMED);
+-        store.insert(booking);
++        Booking booking = confirmed.get();
+         stats.recordConfirmed();
+         BookingLog.confirmed(booking);
+         return BookingResult.confirmed(booking);
+     }
+ 
++    /**
++     * The check and the insert as one step: no other caller holding
++     * {@link #bookingLock} can change the room between them.
++     *
++     * @return the new CONFIRMED booking, or empty when the slot is already held
++     */
++    private Optional<Booking> confirmIfFree(String roomId, int startMinute, int endMinute) {
++        bookingLock.lock();
++        try {
++            if (store.hasOverlap(roomId, startMinute, endMinute)) {
++                return Optional.empty();
++            }
++            Booking booking = new Booking(nextId(), roomId, startMinute, endMinute, BookingStatus.CONFIRMED);
++            store.insert(booking);
++            return Optional.of(booking);
++        } finally {
++            bookingLock.unlock();
++        }
++    }
++
+     /**
+      * Queues the caller behind whoever currently holds the slot.
+      *
+@@ -111,7 +143,15 @@ public final class BookingService {
+      *     promoted
+      */
+     public Optional<Booking> cancelBooking(String bookingId) {
+-        Optional<Booking> promoted = store.cancelAndPromote(bookingId);
++        Optional<Booking> promoted;
++        // A promotion creates a CONFIRMED booking too, so it must not land
++        // between a book() call's check and its insert.
++        bookingLock.lock();
++        try {
++            promoted = store.cancelAndPromote(bookingId);
++        } finally {
++            bookingLock.unlock();
++        }
+         stats.recordCancelled();
+         BookingLog.cancelled(bookingId);
+         promoted.ifPresent(BookingLog::promoted);
+```
+
+Milestone-1 test, passing
+(`mvn -B test -Dtest='RaceTest#onlyOneOfTwoBookingsForTheSameSlotIsConfirmed'`):
+
+```
+2026-11-06T15:51:15.240Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:51:15.240Z INFO booking.rejected room=WEH-5409 start=540 end=600 reason=slot already held
+[race] aim=hasOverlap#1 gate fired=true A parked=true B done before release=false hasOverlap calls=2; A got CONFIRMED bk-1, B got REJECTED
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.042 s -- in edu.cmu.cs214.lab10.harness.RaceTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Full suite, passing (`mvn -B test`; the `[race]` lines are one per race test):
+
+```
+[race] aim=hasOverlap#1 (cancel) gate fired=true A parked=true C done before release=false; A got CONFIRMED bk-1, W ended WAITLISTED
+[race] aim=hasOverlap#2 gate fired=true A parked=false B done before release=false hasOverlap calls=2; A got CONFIRMED bk-1, B got REJECTED
+[race] aim=hasOverlap#1 gate fired=true A parked=true B done before release=false hasOverlap calls=2; A got CONFIRMED bk-1, B got REJECTED
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.093 s -- in edu.cmu.cs214.lab10.harness.RaceTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.020 s -- in edu.cmu.cs214.lab10.service.BookingServiceTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in edu.cmu.cs214.lab10.domain.BookingTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
 **Is your milestone-1 test still testing anything?** After your fix, describe
 what that test now exercises. Did `PausingStore` pause a call during the green run? How do
 you know?
+
+**Yes.** It drives the same schedule as before: A parks right after its
+`hasOverlap` call. The difference is that A is now parked while holding
+`bookingLock`. B's `book()` can't reach its check. It blocks on the lock until A
+has inserted, then checks, sees A's booking, and is rejected. So the test now
+exercises the lock itself: a second booker cannot get between the first
+booker's check and insert. Remove the lock and it goes red again, as it was on
+the shipped code.
+
+**Yes, `PausingStore` paused a call during the green run.** The `[race]` line
+shows `gate fired=true A parked=true hasOverlap calls=2`. `B done before
+release=false` means B was still blocked when its bounded join ran out. The
+timing agrees: the test took 2.04 s, which is that join's length
+(`PausingStore.TIMEOUT_MILLIS`), because B waited behind the parked A for all
+of it. If nothing had been paused, the line would show `A parked=false`.
+
+**Test adjustment:** the assertion is unchanged (exactly one CONFIRMED booking
+in the real store). I added the `[race]` line, printed but not asserted, so a
+green run shows what the gate did. A now gets bk-1, because B never reaches
+`nextId()` while A holds the lock.
+
+**The milestone-2 test** (`hasOverlap`, call 2) is green on this code but
+tests nothing. It shows `A parked=false`, because the shipped `book()` makes
+only one `hasOverlap` call. I kept it as the evidence for the milestone-2
+verdict. It only means something against the patch.
 
 **What runs one at a time now that ran in parallel before.** Name concretely which callers
 queue behind which. "Nothing, it is just correct now" does not count as an
 answer.
 
+On one `BookingService` instance, every `book()` that passes validation and
+every `cancelBooking()` now queue behind one another on `bookingLock`:
+
+- **Bookers wait behind other bookers, even for a different room.** A
+  WEH-5409 booking queues behind a GHC-4301 booking, though the two can never
+  conflict. The lock is per service, not per room.
+- **Bookers and cancellers wait behind each other.** A cancel waits for an
+  in-progress booking's check and insert, and a booking waits for a cancel's
+  promotion.
+
+Before the fix, each single store call already ran one at a time (the store is
+`synchronized`), but two bookers' check-and-insert pairs could interleave. Now
+a whole check-plus-insert, or cancel-plus-promote, finishes before the next one
+starts.
+
+These never take the lock: `joinWaitlist`, `listBookings`, `rooms`, `room`,
+`stats`, rejects for an unknown room or a bad slot, and all logging and stats
+updates.
+
+**Cost:** the lock is held for about two scans of an in-memory list, so the
+wait is microseconds in normal use. The test shows how the cost grows: B waited
+2 s because A stalled while holding the lock. If the store ever became a remote
+database, every booking and cancel in the service would queue behind a network
+round trip.
+
 **What you left unfixed.** For anything your review flagged that you chose not
 to fix, one line each on why.
+
+- **`BookingStats` (row 5):** still a data race. The counts are documented as
+  approximate, nothing reads them to make decisions, and exact counting would
+  add contention just for a dashboard tile.
+- **Two service instances sharing one store (row 6, and this lock's scope):**
+  each instance has its own lock and its own id sequence, so they don't exclude
+  each other and could both issue `bk-1`. I left it because the ticket's ids
+  (bk-8412, bk-8413) are consecutive, which suggests one instance issued both.
+  A proper fix moves the check-and-insert into the store (option 2) and shares
+  one id source, which is a bigger change than this ticket needs.
+- **Log order (row 8):** not a correctness bug. Logging happens outside the
+  lock, so lines can come out of store order. In my 15:50:11 and 15:50:15 runs,
+  B's `booking.rejected` printed before A's `booking.confirmed`, even though A
+  must have inserted first for B to be rejected.
