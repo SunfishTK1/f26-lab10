@@ -135,11 +135,97 @@ org.opentest4j.AssertionFailedError: a room may hold at most one CONFIRMED booki
 
 **Your milestone-1 test on the patched code.** Green or red. Paste the result.
 
+**Green.** I applied the patch with `git apply proposed-fix.diff`, and
+`git diff --stat` showed `BookingService.java | 7 +++++++`. A still parked
+after its first check and B still booked bk-1. But when A was released, the
+patch's re-check saw B's booking and rejected A.
+
+```
+2026-11-06T15:42:19.204Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:19.209Z INFO booking.rejected room=WEH-5409 start=540 end=600 reason=slot already held
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.030 s -- in edu.cmu.cs214.lab10.harness.RaceTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
 **The re-aimed run.** Method name, call index, the pasted result, and one line
 on why that aim tests the patch rather than sidestepping it.
 
+**Aim: `hasOverlap`, call 2** (`RaceTest.onlyOneBookingIsConfirmedWhenTheRecheckGoesStale`).
+A runs alone until it parks, so call 1 is A's original check and call 2 is the
+patch's re-check. A parks right after the re-check answers "free", in the gap
+that still exists between the re-check and the insert. B then makes calls 3
+and 4, both answer "free", and B inserts. A is released and inserts on its
+stale re-check. Red on both runs against the patched code. (The patch builds
+the `Booking` before its re-check, so this time A got bk-1 and B got bk-2.)
+
+**Why this aim tests the patch rather than sidestepping it:** A goes *through*
+the patch's re-check. The re-check runs, answers "free" (`hasOverlap calls=4`,
+two per thread), and the double booking happens anyway. The patch's own defense
+runs and fails. The test does not route around it.
+
+Each run executed both tests. The first two log lines are the re-aimed test
+(red), and the last two are the milestone-1 test (green).
+
+Run 1 (`mvn -B test -Dtest=RaceTest`, patch applied):
+
+```
+2026-11-06T15:42:34.407Z INFO booking.confirmed booking=bk-2 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:34.410Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:34.422Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:34.424Z INFO booking.rejected room=WEH-5409 start=540 end=600 reason=slot already held
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.037 s <<< FAILURE! -- in edu.cmu.cs214.lab10.harness.RaceTest
+[ERROR] edu.cmu.cs214.lab10.harness.RaceTest.onlyOneBookingIsConfirmedWhenTheRecheckGoesStale -- Time elapsed: 0.023 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: a room may hold at most one CONFIRMED booking for any minute (gate fired=true, hasOverlap calls=4; A got CONFIRMED bk-1, B got CONFIRMED bk-2) ==> expected: <1> but was: <2>
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+Run 2 (`mvn -B test -Dtest=RaceTest`, patch applied):
+
+```
+2026-11-06T15:42:35.816Z INFO booking.confirmed booking=bk-2 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:35.818Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:35.830Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:42:35.833Z INFO booking.rejected room=WEH-5409 start=540 end=600 reason=slot already held
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.036 s <<< FAILURE! -- in edu.cmu.cs214.lab10.harness.RaceTest
+[ERROR] edu.cmu.cs214.lab10.harness.RaceTest.onlyOneBookingIsConfirmedWhenTheRecheckGoesStale -- Time elapsed: 0.021 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: a room may hold at most one CONFIRMED booking for any minute (gate fired=true, hasOverlap calls=4; A got CONFIRMED bk-1, B got CONFIRMED bk-2) ==> expected: <1> but was: <2>
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
 **Your verdict.** Accept or reject, and what your milestone-1 result does and
 does not show about the patch.
+
+**Reject.** The patch turns check-then-act into check-then-check-then-act. The
+re-check and the insert are still two separate store calls, and the store's
+lock is released between them, so the re-check's answer can already be stale
+when the insert runs. The patch comment's claim that "there is no window left"
+is false. The window is narrower, not gone. I reverted the patch with
+`git apply -R proposed-fix.diff`, and it is not merged.
+
+What my milestone-1 result shows: going green on the patch shows only that the
+patch closes the one schedule that test pins (a stale first check followed by
+an insert), because the patch put a re-check inside that exact gap. What it
+does not show: that the race is gone. Moving the same pause one call later, to
+the re-check, gives a double booking every time.
+
+The teammate's evidence doesn't hold up either. The suite is single-threaded,
+and "no bad rounds" from the stress runner just means the narrower window is
+hit less often. I ran the stress runner on the patched code: 0, 1, and 1 bad
+rounds out of 2000 each, against 24 and 2 out of 100 before the patch. Rarer is
+not fixed.
+
+**Note on the re-aimed test against the shipped code.** After reverting, the
+full suite runs 13 tests with 1 failure: the milestone-1 test, red as it should
+be. The re-aimed test passes on the shipped code, but only by accident. The
+shipped `book()` makes one `hasOverlap` call, so A never makes call 2.
+`awaitPaused()` times out after 2 s, B's check becomes call 2 and parks *after*
+it has already seen A's booking, and B's join times out after another 2 s
+(`RaceTest` took 4.071 s). A green race test only shows that the one schedule
+it aims at is safe in the code it ran against, because the aim is tied to that
+code's call shape.
 
 ---
 
