@@ -27,17 +27,23 @@ verdict for each. Add or remove rows as needed.
 | 7 | `BookingService.catalog`: `HashMap` built in the constructor, held in a `final` field, never written again | Safe: published through a final field and read-only after construction. |
 | 8 | `BookingLog`: `System.out.println` with a shared `DateTimeFormatter` | Safe: `PrintStream` locks each line and the formatter is immutable. It logs after `insert` and outside any lock, so log order is not proof of store order. |
 
-**Which one explains the ticket, and how you know.** The invariant is that a
-room has at most one CONFIRMED booking covering any minute. Only two code
-paths ever create a CONFIRMED booking: `book()` inserts one, and
-`cancelAndPromote` promotes one. The ticket rules out the second. Neither
-booking was cancelled or waitlisted, both were "issued as confirmed", and the
-log shows two `booking.confirmed` lines with no `booking.cancelled` or
-`booking.promoted` between them. That leaves `book()`. Its only protection for
-the invariant is the `hasOverlap` check on line 70, and that answer holds only
-while the store's lock is held, not until the `insert` on line 74. Two `book()`
-calls for the same slot that both check before either inserts will both pass,
-and both insert CONFIRMED (row 1). The rest of the ticket fits:
+**Which one explains the ticket, and how you know.** Row 1. The code assumes
+that because every store method is thread-safe, the operations built on top of
+them are thread-safe too. That assumption is wrong. `synchronized` makes each
+store call atomic on its own, but the lock is released between calls, so
+nothing protects the gap between them. In `BookingService.book()`, two threads
+can run their `hasOverlap` checks back to back and both see the slot as free.
+Then both freely `insert` a CONFIRMED booking.
+
+I know it's this one because of the invariant the ticket names: a room has at
+most one CONFIRMED booking covering any minute. Only two code paths ever create
+a CONFIRMED booking: `book()` inserts one, and `cancelAndPromote` promotes one.
+The ticket rules out the second. Neither booking was cancelled or waitlisted,
+both were "issued as confirmed", and the log shows two `booking.confirmed` lines
+with no `booking.cancelled` or `booking.promoted` between them. That leaves
+`book()`, whose only protection for the invariant is the `hasOverlap` check on
+line 70. That check is only true while the store's lock is held, not by the
+time of the `insert` on line 74. The rest of the ticket fits:
 
 - It happened in the first minute after a slot opened, when many people are
   racing for the same slot.
