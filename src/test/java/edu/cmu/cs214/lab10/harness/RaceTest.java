@@ -2,6 +2,7 @@ package edu.cmu.cs214.lab10.harness;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import edu.cmu.cs214.lab10.domain.Booking;
 import edu.cmu.cs214.lab10.domain.BookingResult;
 import edu.cmu.cs214.lab10.domain.BookingStatus;
 import edu.cmu.cs214.lab10.domain.Room;
@@ -70,25 +71,89 @@ class RaceTest {
 
         Thread a = new Thread(() -> resultA.set(service.book(WEAN, 540, 600)), "customer-A");
         a.start();
-        gated.awaitPaused();
+        boolean aParked = gated.awaitPaused();
 
         Thread b = new Thread(() -> resultB.set(service.book(WEAN, 540, 600)), "customer-B");
         b.start();
         b.join(PausingStore.TIMEOUT_MILLIS);
+        boolean bDoneBeforeRelease = !b.isAlive();
 
         gated.release();
         a.join(PausingStore.TIMEOUT_MILLIS);
         b.join(PausingStore.TIMEOUT_MILLIS); // B may still be running if it was blocked behind A
 
-        long confirmed = real.bookingsForRoom(WEAN).stream()
-                .filter(booking -> booking.status() == BookingStatus.CONFIRMED)
-                .filter(booking -> booking.overlaps(540, 600))
-                .count();
-        assertEquals(1, confirmed, () -> "a room may hold at most one CONFIRMED booking for any minute"
-                + " (gate fired=" + gated.fired()
-                + ", hasOverlap calls=" + gated.targetCallCount()
+        // Printed, not asserted: what the gate did, so a green run can be told
+        // apart from a run where nothing was ever paused.
+        String observed = "aim=" + method + "#" + call
+                + " gate fired=" + gated.fired()
+                + " A parked=" + aParked
+                + " B done before release=" + bDoneBeforeRelease
+                + " hasOverlap calls=" + gated.targetCallCount()
                 + "; A got " + describe(resultA.get())
-                + ", B got " + describe(resultB.get()) + ")");
+                + ", B got " + describe(resultB.get());
+        System.out.println("[race] " + observed);
+        assertEquals(1, confirmedOverlapping(real, 540, 600),
+                () -> "a room may hold at most one CONFIRMED booking for any minute (" + observed + ")");
+    }
+
+    /**
+     * Milestone 3: why the fix's lock also covers {@code cancelBooking}. A
+     * promotion is the other way a CONFIRMED booking gets created, so it can
+     * land in the same gap as a second booker.
+     *
+     * <p>Setup, written straight into the real store so it makes no gated
+     * calls: X holds [540, 570) and W waits for [540, 600). A books [570, 600),
+     * which is free, and parks right after its check ({@code hasOverlap}, call
+     * 1). C then cancels X. That promotes W to [540, 600), because nothing
+     * confirmed overlaps W yet. Releasing A lets it insert [570, 600) on its
+     * stale answer, on top of W.
+     */
+    @Test
+    void aPromotionCannotLandBetweenABookingsCheckAndItsInsert() throws InterruptedException {
+        InMemoryBookingStore real = new InMemoryBookingStore();
+        real.insert(new Booking("x-1", WEAN, 540, 570, BookingStatus.CONFIRMED));
+        real.insert(new Booking("w-1", WEAN, 540, 600, BookingStatus.WAITLISTED));
+        PausingStore gated = new PausingStore(real, "hasOverlap", 1);
+        BookingService service = new BookingService(gated, ROOMS);
+        AtomicReference<BookingResult> resultA = new AtomicReference<>();
+
+        Thread a = new Thread(() -> resultA.set(service.book(WEAN, 570, 600)), "customer-A");
+        a.start();
+        boolean aParked = gated.awaitPaused();
+
+        Thread c = new Thread(() -> service.cancelBooking("x-1"), "canceller-C");
+        c.start();
+        c.join(PausingStore.TIMEOUT_MILLIS);
+        boolean cDoneBeforeRelease = !c.isAlive();
+
+        gated.release();
+        a.join(PausingStore.TIMEOUT_MILLIS);
+        c.join(PausingStore.TIMEOUT_MILLIS); // C may still be running if it was blocked behind A
+
+        String observed = "aim=hasOverlap#1 (cancel)"
+                + " gate fired=" + gated.fired()
+                + " A parked=" + aParked
+                + " C done before release=" + cDoneBeforeRelease
+                + "; A got " + describe(resultA.get())
+                + ", W ended " + statusOf(real, "w-1");
+        System.out.println("[race] " + observed);
+        assertEquals(1, confirmedOverlapping(real, 570, 600),
+                () -> "a room may hold at most one CONFIRMED booking for any minute (" + observed + ")");
+    }
+
+    private static long confirmedOverlapping(InMemoryBookingStore real, int start, int end) {
+        return real.bookingsForRoom(WEAN).stream()
+                .filter(booking -> booking.status() == BookingStatus.CONFIRMED)
+                .filter(booking -> booking.overlaps(start, end))
+                .count();
+    }
+
+    private static String statusOf(InMemoryBookingStore real, String bookingId) {
+        return real.bookingsForRoom(WEAN).stream()
+                .filter(booking -> booking.id().equals(bookingId))
+                .map(booking -> booking.status().toString())
+                .findFirst()
+                .orElse("missing");
     }
 
     private static String describe(BookingResult result) {
