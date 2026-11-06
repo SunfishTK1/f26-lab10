@@ -20,12 +20,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>Times are raw minutes from midnight and ranges are half-open, matching
  * {@link Booking}.
  *
- * <p>Thread safety: safe for concurrent use. The service owns no mutable
- * booking state of its own. The room catalog is built once in the constructor
- * and never written again, and every read and write of booking data goes
- * through {@link BookingStore}, whose methods are each synchronized. Since the
- * store is thread safe, the operations built on top of it are too. The only
- * other field that changes after construction is {@link BookingStats}, and its
+ * <p>Thread safety: safe for concurrent use through one service instance. The
+ * room catalog is built once in the constructor and never written again, and
+ * booking data lives in {@link BookingStore}, which makes each single call
+ * atomic. That is not enough on its own: an operation that checks the store
+ * and then writes based on the answer spans two calls, and the store's lock is
+ * released in between. So every path that can create a CONFIRMED booking takes
+ * {@code bookingLock} around its check and its write: {@link #book}'s overlap
+ * check and insert, and {@link #cancelBooking}'s cancel-and-promote. The lock
+ * belongs to this instance, so two services pointed at the same store do not
+ * exclude each other. {@link BookingStats} is still unsynchronized, and its
  * numbers are documented as approximate.
  */
 public final class BookingService {
@@ -138,7 +142,15 @@ public final class BookingService {
      *     promoted
      */
     public Optional<Booking> cancelBooking(String bookingId) {
-        Optional<Booking> promoted = store.cancelAndPromote(bookingId);
+        Optional<Booking> promoted;
+        // A promotion creates a CONFIRMED booking too, so it must not land
+        // between a book() call's check and its insert.
+        bookingLock.lock();
+        try {
+            promoted = store.cancelAndPromote(bookingId);
+        } finally {
+            bookingLock.unlock();
+        }
         stats.recordCancelled();
         BookingLog.cancelled(bookingId);
         promoted.ifPresent(BookingLog::promoted);
