@@ -1,12 +1,75 @@
 package edu.cmu.cs214.lab10.harness;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import edu.cmu.cs214.lab10.domain.BookingResult;
+import edu.cmu.cs214.lab10.domain.BookingStatus;
+import edu.cmu.cs214.lab10.domain.Room;
+import edu.cmu.cs214.lab10.service.BookingService;
+import edu.cmu.cs214.lab10.store.InMemoryBookingStore;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+
 /**
- * Where your concurrency tests go.
- *
- * <p>Empty on purpose. The wiring you need is written out below; what to aim it
- * at, and what scenario to drive through it, is yours to work out.
+ * Concurrency tests that pin one interleaving with {@link PausingStore}
+ * instead of hoping for it.
  */
 class RaceTest {
+
+    private static final String WEAN = "WEH-5409";
+    private static final List<Room> ROOMS = List.of(
+            new Room(WEAN, "Wean 5409", 12),
+            new Room("GHC-4301", "Gates 4301", 30));
+
+    /**
+     * Milestone 1: two customers book the same room and slot, and both check
+     * for an overlap before either one inserts.
+     *
+     * <p>Aim: {@code hasOverlap}, call 1. Thread A makes that call and parks
+     * right after the store answers "free", before {@code book()} can act on
+     * the answer. Thread B then runs {@code book()} start to finish. Its
+     * {@code hasOverlap} is call 2, so it passes straight through, and it also
+     * sees "free" because A has not inserted yet. Releasing A lets it insert
+     * on its stale answer.
+     */
+    @Test
+    void onlyOneOfTwoBookingsForTheSameSlotIsConfirmed() throws InterruptedException {
+        InMemoryBookingStore real = new InMemoryBookingStore();
+        PausingStore gated = new PausingStore(real, "hasOverlap", 1);
+        BookingService service = new BookingService(gated, ROOMS);
+        AtomicReference<BookingResult> resultA = new AtomicReference<>();
+        AtomicReference<BookingResult> resultB = new AtomicReference<>();
+
+        Thread a = new Thread(() -> resultA.set(service.book(WEAN, 540, 600)), "customer-A");
+        a.start();
+        gated.awaitPaused();
+
+        Thread b = new Thread(() -> resultB.set(service.book(WEAN, 540, 600)), "customer-B");
+        b.start();
+        b.join(PausingStore.TIMEOUT_MILLIS);
+
+        gated.release();
+        a.join(PausingStore.TIMEOUT_MILLIS);
+        b.join(PausingStore.TIMEOUT_MILLIS); // B may still be running if it was blocked behind A
+
+        long confirmed = real.bookingsForRoom(WEAN).stream()
+                .filter(booking -> booking.status() == BookingStatus.CONFIRMED)
+                .filter(booking -> booking.overlaps(540, 600))
+                .count();
+        assertEquals(1, confirmed, () -> "a room may hold at most one CONFIRMED booking for any minute"
+                + " (gate fired=" + gated.fired()
+                + ", hasOverlap calls=" + gated.targetCallCount()
+                + "; A got " + describe(resultA.get())
+                + ", B got " + describe(resultB.get()) + ")");
+    }
+
+    private static String describe(BookingResult result) {
+        if (result == null) {
+            return "no result";
+        }
+        return result.outcome() + result.booking().map(booking -> " " + booking.id()).orElse("");
+    }
 
     // ------------------------------------------------------------------
     // Wiring example 1: wrap the store
