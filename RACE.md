@@ -74,11 +74,60 @@ is parked.
 If the run turned out different from your prediction, add one line on what
 you missed. Leave the table as you first wrote it.
 
+**Run vs. prediction:** it matched on every point. B got bk-1 and logged first,
+A got bk-2, there was no `booking.rejected` line, and the result was expected
+1, was 2. Nothing missed.
+
 ### Your race test
 
 **How you aimed `PausingStore`, and the result.** Method name and call index, why
 that pair pins the schedule you predicted, and the output of two separate
 runs (assertion failure and log lines).
+
+**Aim: `hasOverlap`, call 1.** The race lives in the gap between `book()`'s
+check and its insert, so I park a thread inside that gap. `PausingStore` parks
+*after* the real call returns. Thread A makes call 1, so it is frozen holding
+the answer "free" before `book()` can act on it. The test starts B only after
+`awaitPaused()` returns, so B's check is always call 2. Call 2 passes through
+the spent gate, and B also sees an empty store. B finishes completely, and only
+then do I release A, which inserts on its stale answer. No step is left to the
+scheduler, which is why it fails every time. Aiming at `insert`, call 1 would
+not work: A's booking would already be in the store when B checks, so B would
+be correctly rejected.
+
+The test (`RaceTest.onlyOneOfTwoBookingsForTheSameSlotIsConfirmed`) asserts
+only the end state of the real store: exactly one CONFIRMED booking for
+WEH-5409 [540, 600). Its failure message also reports whether the gate fired
+and what each thread got.
+
+**Result: red on both runs, the same way.** The gate fired, `hasOverlap` was
+called twice, and both threads got CONFIRMED. Each run took about 0.03 s, which
+also shows that no bounded wait timed out. If the gate had never fired,
+`awaitPaused()` alone would have taken 2 s.
+
+Run 1 (`mvn -B test -Dtest=RaceTest`):
+
+```
+2026-11-06T15:37:29.326Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:37:29.329Z INFO booking.confirmed booking=bk-2 room=WEH-5409 start=540 end=600
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.038 s <<< FAILURE! -- in edu.cmu.cs214.lab10.harness.RaceTest
+[ERROR] edu.cmu.cs214.lab10.harness.RaceTest.onlyOneOfTwoBookingsForTheSameSlotIsConfirmed -- Time elapsed: 0.028 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: a room may hold at most one CONFIRMED booking for any minute (gate fired=true, hasOverlap calls=2; A got CONFIRMED bk-2, B got CONFIRMED bk-1) ==> expected: <1> but was: <2>
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+Run 2 (`mvn -B test -Dtest=RaceTest`):
+
+```
+2026-11-06T15:37:30.643Z INFO booking.confirmed booking=bk-1 room=WEH-5409 start=540 end=600
+2026-11-06T15:37:30.645Z INFO booking.confirmed booking=bk-2 room=WEH-5409 start=540 end=600
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.031 s <<< FAILURE! -- in edu.cmu.cs214.lab10.harness.RaceTest
+[ERROR] edu.cmu.cs214.lab10.harness.RaceTest.onlyOneOfTwoBookingsForTheSameSlotIsConfirmed -- Time elapsed: 0.022 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: a room may hold at most one CONFIRMED booking for any minute (gate fired=true, hasOverlap calls=2; A got CONFIRMED bk-2, B got CONFIRMED bk-1) ==> expected: <1> but was: <2>
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
 
 ---
 
