@@ -35,8 +35,35 @@ class RaceTest {
      */
     @Test
     void onlyOneOfTwoBookingsForTheSameSlotIsConfirmed() throws InterruptedException {
+        assertOneConfirmedWhenFirstBookerParksAt("hasOverlap", 1);
+    }
+
+    /**
+     * Milestone 2: the same race, re-aimed at the teammate's patch, which
+     * re-checks {@code hasOverlap} right before {@code insert}.
+     *
+     * <p>Aim: {@code hasOverlap}, call 2. A runs alone until it parks, so calls
+     * 1 and 2 are both A's: its original check, then the patch's re-check. A
+     * parks right after the re-check answers "free", in the gap between that
+     * re-check and the insert. B then makes both of its checks (calls 3 and
+     * 4), both answer "free", and B inserts. Releasing A lets it insert on its
+     * stale re-check.
+     */
+    @Test
+    void onlyOneBookingIsConfirmedWhenTheRecheckGoesStale() throws InterruptedException {
+        assertOneConfirmedWhenFirstBookerParksAt("hasOverlap", 2);
+    }
+
+    /**
+     * Two customers book WEH-5409 [540, 600) through a store gated at the given
+     * aim. A starts first and runs until the gate parks it. B starts only then
+     * and books. Then A is released. Asserts only the end state: the room holds
+     * exactly one CONFIRMED booking for the slot.
+     */
+    private static void assertOneConfirmedWhenFirstBookerParksAt(String method, int call)
+            throws InterruptedException {
         InMemoryBookingStore real = new InMemoryBookingStore();
-        PausingStore gated = new PausingStore(real, "hasOverlap", 1);
+        PausingStore gated = new PausingStore(real, method, call);
         BookingService service = new BookingService(gated, ROOMS);
         AtomicReference<BookingResult> resultA = new AtomicReference<>();
         AtomicReference<BookingResult> resultB = new AtomicReference<>();
