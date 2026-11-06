@@ -40,8 +40,9 @@ public final class BookingService {
     private final AtomicLong sequence = new AtomicLong();
 
     /**
-     * Makes a check of the store and the write that depends on it one step.
-     * Held only around those two store calls, never around logging or stats.
+     * Guards every path that can create a CONFIRMED booking, so a check of the
+     * store and the write that depends on it happen as one step. Held only
+     * around store calls, never around logging or stats.
      */
     private final ReentrantLock bookingLock = new ReentrantLock();
 
